@@ -114,4 +114,7 @@ std::vector<uint8_t> &ReadQRData  (std::vector<uint8_t> &buffer);
 std::vector<uint8_t> &ReadQRImage (std::vector<uint8_t> &buffer);
 } // namespace Qr
 } // namespace Scanner
+namespace LuaJITMem {
+void Init       (size_t reserveSizeMB);
+}
 } // namespace patches
