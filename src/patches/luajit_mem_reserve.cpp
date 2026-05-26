@@ -32,8 +32,7 @@ constexpr size_t SMALL_FINE_CLASSES = SMALL_FINE_MAX / SMALL_FINE_STEP;
 constexpr size_t SMALL_COARSE_CLASSES = (SMALL_MAX - SMALL_FINE_MAX) / SMALL_COARSE_STEP;
 constexpr size_t SMALL_CLASSES = SMALL_FINE_CLASSES + SMALL_COARSE_CLASSES;
 constexpr size_t LUA_STATE_SIZE = 5232;
-constexpr size_t LARGE_RESERVE_SIZE = 1024 * 1024;
-constexpr size_t LARGE_RESERVE_COUNT = 4;
+constexpr size_t LARGE_BLOCK_SIZE = 1024 * 1024;
 
 struct alignas (MEMORY_ALLOCATION_ALIGNMENT) BlockHeader {
     u32 magic;
@@ -68,17 +67,17 @@ constexpr size_t HEADER_SIZE      = (sizeof (BlockHeader) + ALIGNMENT - 1) & ~(A
 constexpr size_t SLAB_HEADER_SIZE = (sizeof (SlabHeader) + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
 
 BlockHeader *free_blocks[MAX_ORDERS];
-BlockHeader *large_reserve_blocks[LARGE_RESERVE_COUNT];
 SlabHeader *partial_slabs[SMALL_CLASSES];
 size_t small_alloc_count[SMALL_CLASSES];
 size_t small_free_count[SMALL_CLASSES];
 size_t small_slab_count[SMALL_CLASSES];
 size_t large_alloc_bytes = 0;
 size_t large_free_bytes  = 0;
-bool large_reserve_used[LARGE_RESERVE_COUNT];
+size_t protected_large_split_count = 0;
 
 void write_allocator_dump (size_t failed_size);
 size_t slot_size_for_class (size_t class_index);
+size_t free_block_bytes ();
 
 FUNCTION_PTR (i32, lua_gc, PROC_ADDRESS ("lua51.dll", "lua_gc"), i64, i32, i32);
 
@@ -100,6 +99,18 @@ order_for (size_t size) {
 size_t
 block_size_for (u32 order) {
     return BUDDY_MIN_SIZE << order;
+}
+
+void
+write_protected_split_log (size_t size) {
+    LogMessage (LogLevel::WARN, "LuaJIT allocator split protected large block: count={} request={} free_bytes={} large_live={}", protected_large_split_count,
+                size, free_block_bytes (), large_alloc_bytes - large_free_bytes);
+}
+
+void
+write_gc_log (size_t size) {
+    LogMessage (LogLevel::WARN, "LuaJIT allocator forced GC: request={} free_bytes={} large_live={}", size, free_block_bytes (),
+                large_alloc_bytes - large_free_bytes);
 }
 
 void
@@ -131,12 +142,19 @@ buddy_for (BlockHeader *block) {
 }
 
 BlockHeader *
-try_alloc_block (u32 target_order, size_t size) {
+try_alloc_block (u32 target_order, size_t size, bool preserve_large_blocks = true) {
     if (target_order >= MAX_ORDERS) return nullptr;
 
+    const auto large_order = order_for (LARGE_BLOCK_SIZE);
+    const auto max_order   = preserve_large_blocks && target_order < large_order ? large_order : MAX_ORDERS;
     auto order = target_order;
-    while (order < MAX_ORDERS && !free_blocks[order]) order++;
-    if (order >= MAX_ORDERS) return nullptr;
+    while (order < max_order && !free_blocks[order]) order++;
+    if (order >= max_order) return nullptr;
+
+    if (!preserve_large_blocks && target_order < large_order && order >= large_order) {
+        protected_large_split_count++;
+        write_protected_split_log (size);
+    }
 
     auto block = free_blocks[order];
     remove_free_block (block);
@@ -209,12 +227,6 @@ write_allocator_dump (size_t failed_size) {
     std::fprintf (file, "large_alloc_bytes=%zu\n", large_alloc_bytes);
     std::fprintf (file, "large_free_bytes=%zu\n", large_free_bytes);
     std::fprintf (file, "large_live_bytes=%zu\n", large_alloc_bytes - large_free_bytes);
-
-    size_t used_reserves = 0;
-    for (size_t i = 0; i < LARGE_RESERVE_COUNT; i++) {
-        if (large_reserve_used[i]) used_reserves++;
-    }
-    std::fprintf (file, "large_reserve_used=%zu/%zu\n", used_reserves, LARGE_RESERVE_COUNT);
 
     std::fprintf (file, "\n[buddy_free_blocks]\n");
     for (u32 order = 0; order < MAX_ORDERS; order++) {
@@ -315,11 +327,11 @@ alloc_small (size_t size) {
 }
 
 void *
-try_alloc_small (size_t size) {
+try_alloc_small (size_t size, bool preserve_large_blocks = true) {
     const auto class_index = class_index_for (size);
     auto slab              = partial_slabs[class_index];
     if (!slab) {
-        slab = reinterpret_cast<SlabHeader *> (try_alloc_block (order_for (SLAB_SIZE), SLAB_SIZE));
+        slab = reinterpret_cast<SlabHeader *> (try_alloc_block (order_for (SLAB_SIZE), SLAB_SIZE, preserve_large_blocks));
         if (!slab) return nullptr;
 
         slab->magic       = SLAB_MAGIC;
@@ -367,7 +379,7 @@ free_small (SlabHeader *slab, void *ptr) {
     small_slab_count[slab->class_index]--;
     auto block   = reinterpret_cast<BlockHeader *> (slab);
     block->magic = BLOCK_MAGIC;
-    block->order = 0;
+    block->order = order_for (SLAB_SIZE);
     free_block (block);
 }
 
@@ -380,23 +392,11 @@ alloc_from_reserved (size_t size) {
 }
 
 void *
-try_alloc_from_reserved (size_t size) {
-    if (size <= SMALL_MAX) return try_alloc_small (size);
+try_alloc_from_reserved (size_t size, bool preserve_large_blocks = true) {
+    if (size <= SMALL_MAX) return try_alloc_small (size, preserve_large_blocks);
 
-    const auto block = try_alloc_block (order_for (HEADER_SIZE + size), size);
-    if (block) return reinterpret_cast<char *> (block) + HEADER_SIZE;
-
-    for (size_t i = 0; i < LARGE_RESERVE_COUNT; i++) {
-        auto reserve = large_reserve_blocks[i];
-        if (!large_reserve_used[i] && reserve && HEADER_SIZE + size <= block_size_for (reserve->order)) {
-            large_reserve_used[i] = true;
-            reserve->size         = size;
-            large_alloc_bytes += block_size_for (reserve->order);
-            return reinterpret_cast<char *> (reserve) + HEADER_SIZE;
-        }
-    }
-
-    return nullptr;
+    const auto block = try_alloc_block (order_for (HEADER_SIZE + size), size, preserve_large_blocks);
+    return block ? reinterpret_cast<char *> (block) + HEADER_SIZE : nullptr;
 }
 
 void
@@ -408,13 +408,6 @@ free_reserved (void *ptr) {
 
     auto block = reinterpret_cast<BlockHeader *> (reinterpret_cast<char *> (ptr) - HEADER_SIZE);
     large_free_bytes += block_size_for (block->order);
-    for (size_t i = 0; i < LARGE_RESERVE_COUNT; i++) {
-        if (block == large_reserve_blocks[i]) {
-            large_reserve_used[i] = false;
-            block->size           = 0;
-            return;
-        }
-    }
     free_block (block);
 }
 
@@ -434,9 +427,10 @@ can_reuse (void *ptr, size_t size) {
 }
 
 void
-collect_garbage_once () {
+collect_garbage_once (size_t size) {
     if (!lua_state || gc_retrying) return;
 
+    write_gc_log (size);
     gc_retrying = true;
     lua_gc (lua_state, 2, 0);
     gc_retrying = false;
@@ -467,10 +461,10 @@ lj_alloc_f (void *msp, void *ptr, size_t osize, size_t nsize) {
             return result;
         }
 
-        collect_garbage_once ();
+        collect_garbage_once (size);
 
         AcquireSRWLockExclusive (&allocator_lock);
-        result = try_alloc_from_reserved (size);
+        result = try_alloc_from_reserved (size, false);
         if (!result) {
             LogMessage (LogLevel::ERROR, "Failed to allocate 0x{:x} on reserved space after LuaJIT GC", size);
             write_allocator_dump (size);
@@ -496,10 +490,10 @@ lj_alloc_f (void *msp, void *ptr, size_t osize, size_t nsize) {
     auto new_ptr = try_alloc_from_reserved (size);
     if (!new_ptr) {
         ReleaseSRWLockExclusive (&allocator_lock);
-        collect_garbage_once ();
+        collect_garbage_once (size);
 
         AcquireSRWLockExclusive (&allocator_lock);
-        new_ptr = try_alloc_from_reserved (size);
+        new_ptr = try_alloc_from_reserved (size, false);
         if (!new_ptr) {
             LogMessage (LogLevel::ERROR, "Failed to reallocate 0x{:x} on reserved space after LuaJIT GC", size);
             write_allocator_dump (size);
@@ -562,8 +556,6 @@ Init (size_t reserveSizeMB) {
     for (auto &slab_count : small_slab_count) slab_count = 0;
     large_alloc_bytes = 0;
     large_free_bytes  = 0;
-    for (auto &reserve : large_reserve_blocks) reserve = nullptr;
-    for (auto &used : large_reserve_used) used = false;
 
     auto block   = reinterpret_cast<BlockHeader *> (reserved_mem);
     block->magic = BLOCK_MAGIC;
@@ -572,14 +564,6 @@ Init (size_t reserveSizeMB) {
     block->prev  = nullptr;
     block->next  = nullptr;
     push_free_block (block);
-
-    for (auto &reserve : large_reserve_blocks) {
-        reserve = try_alloc_block (order_for (LARGE_RESERVE_SIZE), LARGE_RESERVE_SIZE);
-        if (!reserve) break;
-
-        large_alloc_bytes -= block_size_for (reserve->order);
-        reserve->size = 0;
-    }
 
     auto luajit = LoadLibraryA ("lua51.dll");
     assert (luajit);
