@@ -249,6 +249,7 @@ DllMain (HMODULE module, const DWORD reason, LPVOID reserved) {
         INSTALL_HOOK (ws2_getaddrinfo);
 
         bnusio::Init ();
+        patches::LuaJITMem::Init (luajitReserveSize);
 
         switch (gameVersion) {
         case GameVersion::UNKNOWN: break;
@@ -264,7 +265,6 @@ DllMain (HMODULE module, const DWORD reason, LPVOID reserved) {
         patches::AmAuth::Init ();
         patches::LayeredFs::Init ();
         patches::TestMode::Init ();
-        patches::LuaJITMem::Init (luajitReserveSize);
     }
     return true;
 }
