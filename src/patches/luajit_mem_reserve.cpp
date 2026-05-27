@@ -13,7 +13,6 @@ HMODULE ntdll;
 long (*avm) (HANDLE handle, void **addr, ULONG zbits, size_t *size, ULONG alloctype, ULONG prot);
 void *reserved_mem;
 size_t reserved_size               = 0;
-size_t arena_size                  = 0;
 volatile i64 lua_state             = 0;
 SRWLOCK allocator_lock             = SRWLOCK_INIT;
 thread_local bool gc_retrying      = false;
@@ -103,13 +102,13 @@ block_size_for (u32 order) {
 
 void
 write_protected_split_log (size_t size) {
-    LogMessage (LogLevel::WARN, "LuaJIT allocator split protected large block: count={} request={} free_bytes={} large_live={}", protected_large_split_count,
+    LogMessage (LogLevel::DEBUG, "LuaJIT allocator split protected large block: count={} request={} free_bytes={} large_live={}", protected_large_split_count,
                 size, free_block_bytes (), large_alloc_bytes - large_free_bytes);
 }
 
 void
 write_gc_log (size_t size) {
-    LogMessage (LogLevel::WARN, "LuaJIT allocator forced GC: request={} free_bytes={} large_live={}", size, free_block_bytes (),
+    LogMessage (LogLevel::WARN, "LuaJIT allocator forced GC as last resort: request={} free_bytes={} large_live={}", size, free_block_bytes (),
                 large_alloc_bytes - large_free_bytes);
 }
 
@@ -137,7 +136,7 @@ BlockHeader *
 buddy_for (BlockHeader *block) {
     const auto offset       = static_cast<size_t> (reinterpret_cast<char *> (block) - reinterpret_cast<char *> (reserved_mem));
     const auto buddy_offset = offset ^ block_size_for (block->order);
-    if (buddy_offset >= arena_size) return nullptr;
+    if (buddy_offset >= reserved_size) return nullptr;
     return reinterpret_cast<BlockHeader *> (reinterpret_cast<char *> (reserved_mem) + buddy_offset);
 }
 
@@ -222,7 +221,6 @@ write_allocator_dump (size_t failed_size) {
     const auto free_bytes = free_block_bytes ();
     std::fprintf (file, "failed_size=%zu\n", failed_size);
     std::fprintf (file, "reserved_size=%zu\n", reserved_size);
-    std::fprintf (file, "arena_size=%zu\n", arena_size);
     std::fprintf (file, "buddy_free_bytes=%zu\n", free_bytes);
     std::fprintf (file, "large_alloc_bytes=%zu\n", large_alloc_bytes);
     std::fprintf (file, "large_free_bytes=%zu\n", large_free_bytes);
@@ -461,12 +459,17 @@ lj_alloc_f (void *msp, void *ptr, size_t osize, size_t nsize) {
             return result;
         }
 
-        collect_garbage_once (size);
-
         AcquireSRWLockExclusive (&allocator_lock);
         result = try_alloc_from_reserved (size, false);
         if (!result) {
-            LogMessage (LogLevel::ERROR, "Failed to allocate 0x{:x} on reserved space after LuaJIT GC", size);
+            ReleaseSRWLockExclusive (&allocator_lock);
+            collect_garbage_once (size);
+
+            AcquireSRWLockExclusive (&allocator_lock);
+            result = try_alloc_from_reserved (size, false);
+        }
+        if (!result) {
+            LogMessage (LogLevel::ERROR, "Failed to allocate 0x{:x} on reserved space", size);
             write_allocator_dump (size);
             ReleaseSRWLockExclusive (&allocator_lock);
             ExitProcess (1);
@@ -490,12 +493,18 @@ lj_alloc_f (void *msp, void *ptr, size_t osize, size_t nsize) {
     auto new_ptr = try_alloc_from_reserved (size);
     if (!new_ptr) {
         ReleaseSRWLockExclusive (&allocator_lock);
-        collect_garbage_once (size);
 
         AcquireSRWLockExclusive (&allocator_lock);
         new_ptr = try_alloc_from_reserved (size, false);
         if (!new_ptr) {
-            LogMessage (LogLevel::ERROR, "Failed to reallocate 0x{:x} on reserved space after LuaJIT GC", size);
+            ReleaseSRWLockExclusive (&allocator_lock);
+            collect_garbage_once (size);
+
+            AcquireSRWLockExclusive (&allocator_lock);
+            new_ptr = try_alloc_from_reserved (size, false);
+        }
+        if (!new_ptr) {
+            LogMessage (LogLevel::ERROR, "Failed to reallocate 0x{:x} on reserved space", size);
             write_allocator_dump (size);
             ReleaseSRWLockExclusive (&allocator_lock);
             ExitProcess (1);
@@ -546,9 +555,6 @@ Init (size_t reserveSizeMB) {
         return;
     }
 
-    arena_size = BUDDY_MIN_SIZE;
-    while ((arena_size << 1) <= reserved_size) arena_size <<= 1;
-
     for (auto &free_block : free_blocks) free_block = nullptr;
     for (auto &partial_slab : partial_slabs) partial_slab = nullptr;
     for (auto &alloc_count : small_alloc_count) alloc_count = 0;
@@ -557,13 +563,25 @@ Init (size_t reserveSizeMB) {
     large_alloc_bytes = 0;
     large_free_bytes  = 0;
 
-    auto block   = reinterpret_cast<BlockHeader *> (reserved_mem);
-    block->magic = BLOCK_MAGIC;
-    block->size  = 0;
-    block->order = order_for (arena_size);
-    block->prev  = nullptr;
-    block->next  = nullptr;
-    push_free_block (block);
+    {
+        auto remaining = reserved_size;
+        auto addr      = reinterpret_cast<char *> (reserved_mem);
+        while (remaining > 0) {
+            size_t chunk = BUDDY_MIN_SIZE;
+            while ((chunk << 1) <= remaining) chunk <<= 1;
+
+            auto block   = reinterpret_cast<BlockHeader *> (addr);
+            block->magic = BLOCK_MAGIC;
+            block->size  = 0;
+            block->order = order_for (chunk);
+            block->prev  = nullptr;
+            block->next  = nullptr;
+            push_free_block (block);
+
+            addr += chunk;
+            remaining -= chunk;
+        }
+    }
 
     auto luajit = LoadLibraryA ("lua51.dll");
     assert (luajit);
